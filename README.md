@@ -28,7 +28,7 @@
 ## Этапы выполнения проекта
 
 - Выбор датасета, описание проекта [x]
-- EDA в pandas []
+- EDA в pandas [x]
 - Очистка данных в pandas []
 - Загрузка данных в PostgreSQL []
 - Расчёт продуктовых метрик в SQL []
@@ -68,6 +68,7 @@ cosmetics-shop-product-analysis/
 ├── dashboards/                       # скриншоты и выгрузки для DataLens
 ├── docs/                             # документация
 ├── notebooks/                        # EDA, очистка данных
+    └── 01_EDA.ipynb                       
 ├── sql/                              # SQL-этап (после EDA и очистки)              
 ├── .gitignore                       
 ├── README.md
