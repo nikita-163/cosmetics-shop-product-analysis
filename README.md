@@ -33,6 +33,7 @@
 - Выбор датасета, описание проекта [x]
 - EDA в pandas [x]
 - Очистка данных в pandas [x]
+- Описание метрик [x]
 - Загрузка данных в PostgreSQL []
 - Расчёт продуктовых метрик в SQL []
 - Дашборд в DataLens и итоговый отчёт []
@@ -70,6 +71,7 @@ cosmetics-shop-product-analysis/
 │   └── README.md 
 ├── dashboards/                       # скриншоты и выгрузки для DataLens
 ├── docs/                             # документация
+    └── metrics.md
 ├── notebooks/                        # EDA, очистка данных
     ├── 01_EDA.ipynb                        
     └── 02_cleaning.ipynb                       
