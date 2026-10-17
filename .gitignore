@@ -5,5 +5,10 @@ __pycache__/
 .vscode
 
 # Данные
-data
+data/*
+!data/README.md
+
+# Параметры подключения к БД
+.env
+
 
