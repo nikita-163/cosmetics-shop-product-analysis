@@ -35,7 +35,7 @@
 - Очистка данных в pandas [x]
 - Описание метрик [x]
 - Cоздание объектов базы данных [x]
-- Загрузка данных в PostgreSQL []
+- Загрузка данных в PostgreSQL [x]
 - Расчёт продуктовых метрик в SQL []
 - Дашборд в DataLens и итоговый отчёт []
 
@@ -75,11 +75,14 @@ cosmetics-shop-product-analysis/
     └── metrics.md
 ├── notebooks/                        # EDA, очистка данных
     ├── 01_EDA.ipynb                        
-    └── 02_cleaning.ipynb                       
+    └── 02_cleaning.ipynb
+├── scripts/
+    └── load_to_postgres.py                         
 ├── sql/                              # SQL-этап (после EDA и очистки)    
     ├── 01_create_database.sql                         
     ├── 02_create_schemas.sql                       
-    └── 03_create_stg_events.sql                                      
+    ├── 03_create_stg_events.sql
+    └── 04_stg_quality_check.sql                                      
 ├── .gitignore                       
 ├── README.md
 └── requirements.txt
