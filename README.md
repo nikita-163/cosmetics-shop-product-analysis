@@ -24,6 +24,7 @@
 - Описать метрики, основываясь на бизнес-задачах.
 - Создать базу данных, схему и таблицу для хранения событий.
 - Загрузить очищенные данные в PostgreSQL.
+- Создать витрины для расчёта метрик
 - Рассчитать продуктовые метрики средствами SQL.
 - Собрать дашборд в DataLens и оформить отчёт
 - Сформулировать гипотезы по найденным наблюдениям и проблемам
@@ -36,6 +37,7 @@
 - Описание метрик [x]
 - Cоздание объектов базы данных [x]
 - Загрузка данных в PostgreSQL [x]
+- Создание и проверка витрин [x]
 - Расчёт продуктовых метрик в SQL []
 - Дашборд в DataLens и итоговый отчёт []
 
@@ -54,6 +56,7 @@ Cсылка на страницу датасета на Kaggle: https://www.kagg
 
 ## Стек технологий
 
+- Python — написание скриптов.
 - pandas, numpy, jupyter — обработка, анализ и очистка данных.
 - SQL — расчёт продуктовых метрик.
 - PostgreSQL — хранение данных.
@@ -67,24 +70,28 @@ Cсылка на страницу датасета на Kaggle: https://www.kagg
 ```
 cosmetics-shop-product-analysis/
 ├── data/                             # исходные CSV (не в git)
-    ├── raw/                          
-    ├── processed/                         
-    └── README.md 
+│    ├── raw/                          
+│    ├── processed/                         
+│    └── README.md 
 ├── dashboards/                       # скриншоты и выгрузки для DataLens
 ├── docs/                             # документация
-    └── metrics.md
+│    └── metrics.md
 ├── notebooks/                        # EDA, очистка данных
-    ├── 01_EDA.ipynb                        
-    └── 02_cleaning.ipynb
-├── scripts/
-    └── load_to_postgres.py                         
+│    ├── 01_EDA.ipynb                        
+│    └── 02_cleaning.ipynb
+├── scripts/                          # Скрипт с загрузкой данных в PostgreSQL
+│    └── load_to_postgres.py                         
 ├── sql/                              # SQL-этап (после EDA и очистки)    
-    ├── 01_create_database.sql                         
-    ├── 02_create_schemas.sql                       
-    ├── 03_create_stg_events.sql
-    └── 04_stg_quality_check.sql                                      
+│    ├── 01_create_database.sql                         
+│    ├── 02_create_schemas.sql                       
+│    ├── 03_create_stg_events.sql
+│    ├── 04_stg_quality_check.sql
+│    ├── 05_mart_sessions.sql
+│    ├── 06_mart_quality_check.sql
+│    ├── 07_mart_user_activity_daily.sql
+│    └── 08_mart_users.sql                                     
 ├── .gitignore                       
-├── README.md
+├── README.md                         # Описание проекта
 └── requirements.txt
 ```
 
