@@ -89,7 +89,11 @@ cosmetics-shop-product-analysis/
 │    ├── 05_mart_sessions.sql
 │    ├── 06_mart_quality_check.sql
 │    ├── 07_mart_user_activity_daily.sql
-│    └── 08_mart_users.sql                                     
+│    ├── 08_mart_users.sql
+│    ├── 09_metrics_funnel.sql
+│    ├── 10_metrics_activity.sql
+│    ├── 11_metrics_cohorts_retention.sql
+│    └── 12_metrics_business.sql                                     
 ├── .gitignore                       
 ├── README.md                         # Описание проекта
 └── requirements.txt
