@@ -86,7 +86,7 @@ cosmetics-shop-product-analysis/
 │    ├── 02_create_schemas.sql                       
 │    ├── 03_create_stg_events.sql
 │    ├── 04_stg_quality_check.sql
-│    ├── 05_mart_sessions.sql
+│    ├── 05_mart_sessions_orders.sql
 │    ├── 06_mart_quality_check.sql
 │    ├── 07_mart_user_activity_daily.sql
 │    ├── 08_mart_users.sql

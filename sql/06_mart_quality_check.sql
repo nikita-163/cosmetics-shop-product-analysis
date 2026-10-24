@@ -1,12 +1,12 @@
 -- =============================================================================
 -- 06_mart_quality_check.sql
--- Сверка витрин из 05_mart_sessions.sql, 07_mart_user_activity_daily.sql и 08_mart_users.sql с stg.events.
+-- Сверка витрин из 05_mart_sessions_orders.sql, 07_mart_user_activity_daily.sql и 08_mart_users.sql с stg.events.
 --
 -- Принцип: ожидаемые значения считаются из stg.events независимым запросом
 -- (не копируются из ноутбуков и не вводятся руками), а фактические берутся из
 -- витрины. Поэтому проверка остаётся верной при любом пересчёте данных.
 --
--- Порядок запуска: 05, 07, 08, затем 06 (блоки 3 и 4 читают
+-- Порядок запуска: 05, 07, 08, затем 06 (блоки 4 и 5 читают
 -- mart.user_activity_daily и mart.users, которых до 07 и 08 ещё нет).
 -- =============================================================================
 
@@ -17,16 +17,10 @@ WITH actual AS (
     SELECT
         COUNT(*)::numeric                                   AS rows_total,
         COUNT(*) FILTER (WHERE has_purchase)::numeric       AS purchase_sessions,
-        SUM(gmv)::numeric                                   AS gmv_total,
-        SUM(priced_purchases_cnt)::numeric                  AS priced_purchases_total,
         COUNT(*) FILTER (
             WHERE NOT (has_view OR has_cart OR has_remove_from_cart OR has_purchase)
         )::numeric                                          AS sessions_without_flags,
-        COUNT(*) FILTER (WHERE duration_sec < 0)::numeric   AS negative_duration,
-        -- first_order_time должен быть заполнен ровно у сессий-заказов
-        COUNT(*) FILTER (
-            WHERE (priced_purchases_cnt > 0) IS DISTINCT FROM (first_order_time IS NOT NULL)
-        )::numeric                                          AS order_time_inconsistent
+        COUNT(*) FILTER (WHERE duration_sec < 0)::numeric   AS negative_duration
     FROM mart.sessions
 ),
 stg_pairs AS (
@@ -46,36 +40,6 @@ stg_buyer_pairs AS (
         WHERE user_session IS NOT NULL
             AND event_type = 'purchase'
     ) AS d
-),
-stg_purchases AS (
-    -- Без фильтра по user_session: по EDA у purchase нет пропусков в user_session
-    SELECT
-        COALESCE(SUM(price), 0)::numeric AS gmv_total,
-        COUNT(price)::numeric            AS priced_purchases_total
-    FROM stg.events
-    WHERE event_type = 'purchase'
-        AND NOT is_duplicate
-),
-stg_first_order AS (
-    -- момент первого заказа по каждой паре, посчитанный заново из stg
-    SELECT user_session, user_id, MIN(event_time) AS first_order_time
-    FROM stg.events
-    WHERE event_type = 'purchase'
-        AND NOT is_duplicate
-        AND price IS NOT NULL
-        AND user_session IS NOT NULL
-    GROUP BY user_session, user_id
-),
-order_time_check AS (
-    -- Витрина и stg сравниваются в обе стороны: LEFT JOIN от витрины ловит
-    -- «в витрине время есть, в stg нет» и разные значения, а у сессий без заказа
-    -- в stg_first_order строки нет, и NULL против NULL совпадает.
-    -- IS DISTINCT FROM, а не <>: сравнение с NULL через <> даёт NULL, и случай
-    -- «в витрине NULL, а в stg время есть» не попал бы в счёт.
-    SELECT COUNT(*)::numeric AS mismatched_rows
-    FROM mart.sessions m
-    LEFT JOIN stg_first_order s USING (user_session, user_id)
-    WHERE m.first_order_time IS DISTINCT FROM s.first_order_time
 )
 SELECT
     c.check_name,
@@ -85,22 +49,76 @@ SELECT
 FROM actual a
 CROSS JOIN stg_pairs sp
 CROSS JOIN stg_buyer_pairs sb
-CROSS JOIN stg_purchases spu
-CROSS JOIN order_time_check otc
 CROSS JOIN LATERAL (VALUES
     ('rows = distinct (user_session, user_id) in stg', sp.pairs_total,                a.rows_total),              -- зерно витрины совпадает с числом пар в stg
     ('sessions with has_purchase',                     sb.pairs_with_purchase,        a.purchase_sessions),       -- флаг покупки не потерян и не добавлен лишний
-    ('sum(gmv) = GMV in stg',                          spu.gmv_total,                 a.gmv_total),               -- ни одной копейки GMV не потеряно при группировке и исключении NULL-сессий
-    ('sum(priced_purchases_cnt)',                      spu.priced_purchases_total,    a.priced_purchases_total),  -- то же для числа покупок с ценой
     ('sessions without any flag',                      0::numeric,                    a.sessions_without_flags),  -- 4 типа событий исчерпывающие: хоть один флаг у сессии есть
-    ('sessions with negative duration',                0::numeric,                    a.negative_duration),       -- конец сессии не раньше начала
-    ('first_order_time filled iff priced_purchases_cnt > 0', 0::numeric,              a.order_time_inconsistent), -- время заказа есть у каждой сессии-заказа и нет у остальных
-    ('first_order_time = value recomputed from stg',   0::numeric,                    otc.mismatched_rows)        -- время первого заказа совпало с независимым пересчётом из stg
+    ('sessions with negative duration',                0::numeric,                    a.negative_duration)        -- конец сессии не раньше начала
 ) AS c(check_name, expected, actual);
 
 
 -- -----------------------------------------------------------------------------
--- 2. (справочно) Во сколько строк обошлось зерно (user_session, user_id)
+-- 2. mart.orders: сверка с stg.events
+--    Ожидаемые значения считаются независимо: заказы через DISTINCT, деньги
+--    напрямую из stg. Фильтр по user_session здесь не ставится: по EDA у purchase
+--    нет пропусков в user_session, и если они появятся, проверка это покажет.
+-- -----------------------------------------------------------------------------
+WITH actual AS (
+    SELECT
+        COUNT(*)::numeric                                   AS orders_total,
+        SUM(gmv)::numeric                                   AS gmv_total,
+        SUM(items_cnt)::numeric                             AS items_total,
+        COUNT(*) FILTER (WHERE items_cnt < 1 OR gmv <= 0)::numeric
+                                                            AS empty_orders
+    FROM mart.orders
+),
+stg_orders AS (
+    SELECT COUNT(*)::numeric AS orders_total
+    FROM (
+        SELECT DISTINCT user_session, user_id, event_time
+        FROM stg.events
+        WHERE event_type = 'purchase'
+            AND NOT is_duplicate
+            AND price IS NOT NULL
+    ) AS d
+),
+stg_purchases AS (
+    SELECT
+        COALESCE(SUM(price), 0)::numeric AS gmv_total,
+        COUNT(price)::numeric            AS items_total
+    FROM stg.events
+    WHERE event_type = 'purchase'
+        AND NOT is_duplicate
+),
+orphan_orders AS (
+    -- заказ без сессии с покупкой в mart.sessions или вне границ этой сессии
+    SELECT COUNT(*)::numeric AS orphan_rows
+    FROM mart.orders o
+    LEFT JOIN mart.sessions s USING (user_session, user_id)
+    WHERE s.user_session IS NULL
+        OR NOT s.has_purchase
+        OR o.order_time NOT BETWEEN s.session_start AND s.session_end
+)
+SELECT
+    c.check_name,
+    c.expected::text AS expected,
+    c.actual::text   AS actual,
+    CASE WHEN c.expected = c.actual THEN 'OK' ELSE 'FAIL' END AS status
+FROM actual a
+CROSS JOIN stg_orders so
+CROSS JOIN stg_purchases spu
+CROSS JOIN orphan_orders oo
+CROSS JOIN LATERAL (VALUES
+    ('orders: rows = distinct (session, user, time) in stg', so.orders_total,    a.orders_total),   -- зерно витрины совпадает с независимым пересчётом заказов
+    ('orders: sum(gmv) = GMV in stg',                        spu.gmv_total,      a.gmv_total),      -- ни одной копейки GMV не потеряно при группировке и исключении NULL-сессий
+    ('orders: sum(items_cnt) = priced purchases in stg',     spu.items_total,    a.items_total),    -- то же для числа покупок с ценой
+    ('orders: empty orders (items < 1 or gmv <= 0)',         0::numeric,         a.empty_orders),   -- у заказа есть хотя бы одна позиция и положительная сумма
+    ('orders: without matching purchase session',            0::numeric,         oo.orphan_rows)    -- каждый заказ лежит внутри сессии с has_purchase
+) AS c(check_name, expected, actual);
+
+
+-- -----------------------------------------------------------------------------
+-- 3. (справочно) Во сколько строк обошлось зерно (user_session, user_id)
 --    Ожидается extra_rows >= 272: именно столько сессий имеют больше одного
 --    user_id, и каждая даёт минимум одну лишнюю строку.
 -- -----------------------------------------------------------------------------
@@ -111,7 +129,7 @@ SELECT
 FROM mart.sessions;
 
 -- -----------------------------------------------------------------------------
--- 3. mart.user_activity_daily: сверка с stg.events (07_mart_user_activity_daily.sql)
+-- 4. mart.user_activity_daily: сверка с stg.events (07_mart_user_activity_daily.sql)
 --    Ожидаемые значения считаются независимо: день берём тем же правилом
 --    (UTC), но подсчёт идёт по DISTINCT, а не через группировку, как в витрине.
 -- -----------------------------------------------------------------------------
@@ -159,7 +177,7 @@ CROSS JOIN LATERAL (VALUES
 
 
 -- -----------------------------------------------------------------------------
--- 4. mart.users: сверка с stg.events и с витринами (08_mart_users.sql)
+-- 5. mart.users: сверка с stg.events и с витринами (08_mart_users.sql)
 --    Число пользователей, заказов и GMV считаются заново из stg.events, а не из
 --    других витрин: сверка должна ловить ошибки всей цепочки, а не только 08.
 --    Логические проверки внутри таблицы (порядок дат, понедельник) считаются по
@@ -204,7 +222,7 @@ stg_users AS (
     FROM stg.events
 ),
 stg_orders AS (
-    -- заказ = пара (сессия, пользователь) с покупкой без дубля и с ценой; 
+    -- заказ = (сессия, пользователь, момент покупки) с покупкой без дубля и с ценой;
     -- затем считаем заказы, пользователей с заказом и деньги
     SELECT
         COUNT(*)::numeric                                           AS orders_total,
@@ -212,7 +230,7 @@ stg_orders AS (
         SUM(gmv)::numeric                                           AS gmv_total,
         SUM(priced_purchases)::numeric                              AS priced_purchases_total
     FROM (
-        SELECT user_session, user_id,
+        SELECT user_session, user_id, event_time,
             SUM(price)  AS gmv,
             COUNT(price) AS priced_purchases
         FROM stg.events
@@ -220,7 +238,7 @@ stg_orders AS (
             AND NOT is_duplicate
             AND price IS NOT NULL
             AND user_session IS NOT NULL
-        GROUP BY user_session, user_id
+        GROUP BY user_session, user_id, event_time
     ) AS o
 )
 SELECT

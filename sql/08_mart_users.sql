@@ -1,19 +1,21 @@
 -- =============================================================================
 -- 08_mart_users.sql
--- Витрина mart.users, построенная из mart.user_activity_daily (активность) и mart.sessions (заказы).
--- Запускать только после 05_mart_sessions.sql и 07_mart_user_activity_daily.sql.
+-- Витрина mart.users, построенная из mart.user_activity_daily (активность) и mart.orders (заказы).
+-- Запускать только после 05_mart_sessions_orders.sql и 07_mart_user_activity_daily.sql.
 -- =============================================================================
 --
 -- Правила:
 --   * В витрине все пользователи из stg.events, в том числе те, у кого все
 --     события с user_session IS NULL: они есть в mart.user_activity_daily.
---   * Заказ = строка mart.sessions с priced_purchases_cnt > 0 (см. 05_mart_sessions.sql).
+--   * Заказ = строка mart.orders: (user_session, user_id, order_time), см. 05_mart_sessions_orders.sql.
 --     orders_cnt, gmv, first_order_time, second_order_time считаются по заказам;
 --     has_purchase это любая покупка (как в воронке), поэтому у пользователя может
 --     быть has_purchase = true при orders_cnt = 0 (все его покупки без цены).
 --   * Сессия, поделённая между пользователями (272 случая), даёт заказ каждому из
 --     них, у кого в ней есть покупка с ценой. Деньги при этом не дублируются:
---     gmv строки считается только по событиям этого user_id.
+--     строки mart.orders считаются только по событиям своего user_id.
+--   * Один пользователь может сделать несколько заказов в одной сессии (разные
+--     моменты покупки), поэтому второй заказ не обязательно в другой сессии.
 --   * cohort_week: понедельник недели первой активности (date_trunc('week')).
 --     Данные начинаются во вторник 1 окт 2019, поэтому первая когорта неполная
 --     и включает старых клиентов (см. ограничения в README).
@@ -52,30 +54,29 @@ WITH activity AS (
     GROUP BY user_id
 ),
 order_agg AS (
-    -- деньги и заказы пользователя из сессий
+    -- деньги и заказы пользователя из mart.orders
     SELECT
         user_id,
-        COUNT(*) FILTER (WHERE priced_purchases_cnt > 0)    AS orders_cnt,
-        SUM(priced_purchases_cnt)                           AS priced_purchases_cnt,
+        COUNT(*)                                            AS orders_cnt,
+        SUM(items_cnt)                                      AS priced_purchases_cnt,
         SUM(gmv)                                            AS gmv,
-        MIN(first_order_time)                               AS first_order_time
-    FROM mart.sessions
+        MIN(order_time)                                     AS first_order_time
+    FROM mart.orders
     GROUP BY user_id
 ),
 second_order AS (
     -- Второй заказ: заказы пользователя нумеруются по времени. При равном
     -- времени порядок задаёт user_session, иначе номер был бы случайным.
-    SELECT user_id, first_order_time AS second_order_time
+    SELECT user_id, order_time AS second_order_time
     FROM (
         SELECT
             user_id,
-            first_order_time,
+            order_time,
             ROW_NUMBER() OVER (
                 PARTITION BY user_id
-                ORDER BY first_order_time, user_session
+                ORDER BY order_time, user_session
             ) AS order_num
-        FROM mart.sessions
-        WHERE priced_purchases_cnt > 0
+        FROM mart.orders
     ) AS ranked
     WHERE order_num = 2
 )
@@ -88,7 +89,7 @@ SELECT
     a.has_cart,
     a.has_remove_from_cart,
     a.has_purchase,
-    -- у пользователей без сессий (только события с user_session IS NULL) строки в
+    -- у пользователей без заказов (в том числе только с событиями user_session IS NULL) строки в
     -- order_agg нет: заказов и денег у них нет по определению, поэтому 0, а не NULL
     COALESCE(o.orders_cnt, 0)                           AS orders_cnt,
     COALESCE(o.priced_purchases_cnt, 0)                 AS priced_purchases_cnt,
@@ -103,15 +104,15 @@ LEFT JOIN second_order s ON s.user_id = a.user_id;
 ALTER TABLE mart.users ADD PRIMARY KEY (user_id);
 
 COMMENT ON TABLE  mart.users IS
-    'Одна строка на user_id за весь период. Источники: mart.user_activity_daily (активность) и mart.sessions (заказы).';
+    'Одна строка на user_id за весь период. Источники: mart.user_activity_daily (активность) и mart.orders (заказы).';
 COMMENT ON COLUMN mart.users.cohort_week IS
     'Понедельник недели первой активности (UTC). Первая когорта неполная: данные начинаются во вторник 2019-10-01.';
 COMMENT ON COLUMN mart.users.has_purchase IS
     'Была хотя бы одна покупка, в том числе без цены. Для воронки. Для заказов и денег используй orders_cnt и gmv.';
 COMMENT ON COLUMN mart.users.orders_cnt IS
-    'Число сессий пользователя с priced_purchases_cnt > 0 (заказ с известной ценой).';
+    'Число заказов пользователя в mart.orders (заказ с известной ценой).';
 COMMENT ON COLUMN mart.users.gmv IS
-    'Сумма gmv по сессиям пользователя (без дублей и покупок с ценой NULL); 0, если заказов нет.';
+    'Сумма gmv по заказам пользователя (без дублей и покупок с ценой NULL); 0, если заказов нет.';
 COMMENT ON COLUMN mart.users.first_order_time IS
     'Время первого заказа с известной ценой, UTC; NULL, если заказов нет.';
 COMMENT ON COLUMN mart.users.second_order_time IS
