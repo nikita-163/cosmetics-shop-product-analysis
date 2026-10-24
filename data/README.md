@@ -9,5 +9,5 @@ REES46 «eCommerce Events History in Cosmetics Shop» (Kaggle, автор "mkech
 # Условия использования
 
 Источник: **REES46 Marketing Platform** 
-Cсылка на страницу датасета на Kaggle: https://www.kaggle.com/datasets/mkechinov/ecommerce-events-history-in-cosmetics-shop?select=2019-Nov.csv
+Ссылка на страницу датасета на Kaggle: https://www.kaggle.com/datasets/mkechinov/ecommerce-events-history-in-cosmetics-shop?select=2019-Nov.csv
 

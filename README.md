@@ -35,7 +35,7 @@
 - EDA в pandas [x]
 - Очистка данных в pandas [x]
 - Описание метрик [x]
-- Cоздание объектов базы данных [x]
+- Создание объектов базы данных [x]
 - Загрузка данных в PostgreSQL [x]
 - Создание и проверка витрин [x]
 - Расчёт продуктовых метрик в SQL []
@@ -46,7 +46,7 @@
 Датасет REES46 «eCommerce Events History in Cosmetics Shop» (Kaggle): события интернет-магазина косметики (просмотр, корзина, удаление из корзины, покупка) с временем события, пользователем, сессией, товаром, категорией, брендом и ценой. Файлы разбиты по месяцам.
 
 Источник: **REES46 Marketing Platform** 
-Cсылка на страницу датасета на Kaggle: https://www.kaggle.com/datasets/mkechinov/ecommerce-events-history-in-cosmetics-shop?select=2019-Nov.csv
+Ссылка на страницу датасета на Kaggle: https://www.kaggle.com/datasets/mkechinov/ecommerce-events-history-in-cosmetics-shop?select=2019-Nov.csv
 
 ## Ограничения
 

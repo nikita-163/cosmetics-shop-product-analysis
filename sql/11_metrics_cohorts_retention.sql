@@ -27,6 +27,9 @@
 --     "когорта + N" вне периода данных в матрице не создаются вовсе (нет
 --     «нулей» там, где данных просто ещё нет). Неполные недели остаются с
 --     флагом is_full_week = false и в выводах не интерпретируются.
+--   * «За 30 дней» в блоке 4 считается по точному времени (второй заказ не позже
+--     первого + 30 суток), а интервалы блока 5 по разнице календарных дат UTC,
+--     поэтому граница 30 дней в этих блоках может немного расходиться.
 -- =============================================================================
 
 
@@ -287,15 +290,15 @@ from_stg AS (
 )
 SELECT
     x.check_name,
-    x.mart_value,
-    x.stg_value,
-    CASE WHEN x.mart_value = x.stg_value THEN 'OK' ELSE 'FAIL' END  AS status
+    x.expected,
+    x.actual,
+    CASE WHEN x.expected = x.actual THEN 'OK' ELSE 'FAIL' END  AS status
 FROM from_mart m
 CROSS JOIN from_stg s
 CROSS JOIN LATERAL (VALUES
-    ('buyers (orders >= 1)',        m.buyers,        s.buyers),
-    ('repeat buyers (orders >= 2)', m.repeat_buyers, s.repeat_buyers)
-) AS x(check_name, mart_value, stg_value);
+    ('buyers (orders >= 1)',        s.buyers,        m.buyers),
+    ('repeat buyers (orders >= 2)', s.repeat_buyers, m.repeat_buyers)
+) AS x(check_name, expected, actual);
 
 
 -- 6.3. Время до повторной покупки: число повторных покупателей и сумма
@@ -343,12 +346,12 @@ from_mart AS (
 )
 SELECT
     x.check_name,
-    x.mart_value,
-    x.stg_value,
-    CASE WHEN x.mart_value = x.stg_value THEN 'OK' ELSE 'FAIL' END  AS status
+    x.expected,
+    x.actual,
+    CASE WHEN x.expected = x.actual THEN 'OK' ELSE 'FAIL' END  AS status
 FROM from_mart m
 CROSS JOIN from_stg s
 CROSS JOIN LATERAL (VALUES
-    ('repeat buyers',        m.repeaters, s.repeaters),
-    ('sum of gap_days',      m.gap_sum,   s.gap_sum)
-) AS x(check_name, mart_value, stg_value);
+    ('repeat buyers',        s.repeaters, m.repeaters),
+    ('sum of gap_days',      s.gap_sum,   m.gap_sum)
+) AS x(check_name, expected, actual);

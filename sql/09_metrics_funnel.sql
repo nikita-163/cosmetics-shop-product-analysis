@@ -221,16 +221,16 @@ from_stg AS (
 )
 SELECT
     x.check_name,
-    x.mart_value,
-    x.stg_value,
-    CASE WHEN x.mart_value = x.stg_value THEN 'OK' ELSE 'FAIL' END AS status
+    x.expected,
+    x.actual,
+    CASE WHEN x.expected = x.actual THEN 'OK' ELSE 'FAIL' END AS status
 FROM from_mart m
 CROSS JOIN from_stg s
 CROSS JOIN LATERAL (VALUES
-    ('view users',     m.v, s.v),
-    ('cart users',     m.c, s.c),
-    ('purchase users', m.p, s.p)
-) AS x(check_name, mart_value, stg_value);
+    ('view users',     s.v, m.v),
+    ('cart users',     s.c, m.c),
+    ('purchase users', s.p, m.p)
+) AS x(check_name, expected, actual);
 
 
 -- 4.2. Сессионные метрики за весь период: mart.sessions против stg.events
@@ -262,17 +262,17 @@ from_stg AS (
 )
 SELECT
     x.check_name,
-    x.mart_value,
-    x.stg_value,
-    CASE WHEN x.mart_value = x.stg_value THEN 'OK' ELSE 'FAIL' END AS status
+    x.expected,
+    x.actual,
+    CASE WHEN x.expected = x.actual THEN 'OK' ELSE 'FAIL' END AS status
 FROM from_mart m
 CROSS JOIN from_stg s
 CROSS JOIN LATERAL (VALUES
-    ('view sessions',          m.view_s,        s.view_s),
-    ('converted sessions',     m.conv_s,        s.conv_s),
-    ('cart sessions',          m.cart_s,        s.cart_s),
-    ('cart+purchase sessions', m.cart_purchase_s, s.cart_purchase_s)
-) AS x(check_name, mart_value, stg_value);
+    ('view sessions',          s.view_s,        m.view_s),
+    ('converted sessions',     s.conv_s,        m.conv_s),
+    ('cart sessions',          s.cart_s,        m.cart_s),
+    ('cart+purchase sessions', s.cart_purchase_s, m.cart_purchase_s)
+) AS x(check_name, expected, actual);
 
 
 -- 4.3. Воронка по месяцам: mart.user_activity_daily против stg.events

@@ -46,7 +46,7 @@ CROSS JOIN LATERAL (VALUES
     ('max price',                 '327.78',              s.max_price::text),    -- Максимальная цена 327.78 в 01_EDA, раздел 5, df['price'].describe(), строка max (3.277800e+02).
     -- AT TIME ZONE 'UTC' нужен, чтобы DBeaver не показал время в часовом поясе клиента.
     ('min event_time (UTC)',      '2019-10-01 00:00:00', s.min_time_utc::text),     -- Начало периода в 02_cleaning, раздел 2.
-    ('max event_time (UTC)',      '2020-02-29 23:59:59', s.max_time_utc::text)      -- Rонец периода в 02_cleaning, раздел 2.
+    ('max event_time (UTC)',      '2020-02-29 23:59:59', s.max_time_utc::text)      -- Конец периода в 02_cleaning, раздел 2.
 ) AS c(check_name, expected, actual);
 
 

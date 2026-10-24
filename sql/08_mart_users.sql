@@ -23,7 +23,7 @@
 -- -----------------------------------------------------------------------------
 -- mart.users: одна строка на пользователя (user_id) за весь период.
 --
---    Зерно: (user_id, activity_date)
+--    Зерно: user_id
 --
 --    Применение:
 --      1. воронка по пользователям за весь период: has_view -> has_cart -> has_purchase;
@@ -83,7 +83,7 @@ SELECT
     a.user_id,
     a.first_activity_date,
     a.last_activity_date,
-    date_trunc('week', a.first_activity_date)::date     AS cohort_week,     -- понедельник
+    date_trunc('week', a.first_activity_date::timestamp)::date AS cohort_week,     -- понедельник
     a.has_view,
     a.has_cart,
     a.has_remove_from_cart,

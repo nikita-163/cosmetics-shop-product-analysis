@@ -8,7 +8,7 @@
 --   5. Сверка с независимым источником (stg.events)
 --
 -- Где запускать: подключение к `cosmetics_shop`, каждый запрос отдельно
--- (Ctrl+Enter) или весь файл через Execute Script (Alt+X). Запускать после 07.
+-- (Ctrl+Enter) или весь файл через Execute Script (Alt+X). Запускать после 07 и 08 (блок 5.4 читает mart.users).
 --
 -- Источник: mart.user_activity_daily (одна строка на пользователя и день UTC).
 -- Активный пользователь = любое событие любого типа за период, включая дубли
@@ -181,13 +181,16 @@ FULL JOIN s USING (month);
 
 
 -- 5.4. Общие проверки: уникальные пользователи за весь период и число дней.
---      152 дня = 31 (окт) + 30 (ноя) + 31 (дек) + 31 (янв) + 29 (фев).
+--      Ожидаемое число дней = от первого до последнего дня в stg (UTC); для этих
+--      данных это 152 = 31 (окт) + 30 (ноя) + 31 (дек) + 31 (янв) + 29 (фев).
 WITH u AS (
     SELECT
         (SELECT COUNT(*) FROM mart.users)                           AS users_mart,
         (SELECT COUNT(DISTINCT user_id) FROM mart.user_activity_daily) AS users_daily,
         (SELECT COUNT(DISTINCT user_id) FROM stg.events)            AS users_stg,
-        (SELECT COUNT(DISTINCT activity_date) FROM mart.user_activity_daily) AS days_daily
+        (SELECT COUNT(DISTINCT activity_date) FROM mart.user_activity_daily) AS days_daily,
+        (SELECT MAX(event_time AT TIME ZONE 'UTC')::date - MIN(event_time AT TIME ZONE 'UTC')::date + 1
+           FROM stg.events)                                           AS days_stg
 )
 SELECT
     x.check_name,
@@ -198,5 +201,5 @@ FROM u
 CROSS JOIN LATERAL (VALUES
     ('unique users: mart.users vs stg.events',                u.users_stg, u.users_mart),
     ('unique users: user_activity_daily vs stg.events',       u.users_stg, u.users_daily),
-    ('days with data (окт 2019 - фев 2020)',                  152::bigint, u.days_daily)
+    ('days with data (окт 2019 - фев 2020)',                  u.days_stg,  u.days_daily)
 ) AS x(check_name, expected, actual);
