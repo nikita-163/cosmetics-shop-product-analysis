@@ -16,7 +16,8 @@
 --     "Прошёл" = за период было хотя бы одно событие типа (порядок событий во
 --     времени не проверяем, это ограничение метрики).
 --   * Поведение считаем по всем событиям, включая дубли и покупки с ценой NULL:
---     has_purchase, а не priced_purchases_cnt.
+--     has_purchase, а не заказы из mart.orders (там только покупки без дублей и
+--     с ценой, это деньги, а не поведение).
 --   * Месяц и день в UTC. Сессию относим к месяцу её начала (session_start).
 --   * 100.0 * ... гарантирует деление в numeric: 100 * a / b на целых числах
 --     обрезало бы дробную часть. NULLIF(..., 0) защищает от деления на ноль.
@@ -120,6 +121,9 @@ ORDER BY month;
 --
 --    session_conversion_pct = сессии с view+cart+purchase / сессии с view
 --    abandonment_pct        = 1 - (сессии с cart+purchase / сессии с cart)
+--    Считаются сессии, а не заказы: в одной сессии может быть несколько
+--    заказов (см. 05_mart_sessions_orders.sql), а сессия с покупкой без цены
+--    или с дублем тоже считается сессией с покупкой.
 --    Abandonment это оценка сверху: корзина, оформленная в другой сессии,
 --    считается брошенной (см. раздел 6 в docs/metrics.md).
 -- -----------------------------------------------------------------------------
@@ -153,7 +157,10 @@ ORDER BY month NULLS LAST;
 
 -- -----------------------------------------------------------------------------
 -- 3. Доля удалений из корзины (пользователи)
---    cart_remove_users / cart_users, где знаменатель только пользователи с cart.
+--    users_with_cart_and_remove / users_with_cart, где знаменатель только
+--    пользователи с cart. Это не шаг воронки: users_with_cart здесь все
+--    пользователи с cart, а в блоках 1.1 и 1.2 cart_users это пользователи с
+--    view и cart (строгая воронка), поэтому числа различаются.
 --    Весь период берём из mart.users, месяцы из mart.user_activity_daily.
 -- -----------------------------------------------------------------------------
 WITH user_month AS (
@@ -168,23 +175,23 @@ WITH user_month AS (
 by_month AS (
     SELECT
         month::text                                             AS period,
-        COUNT(*) FILTER (WHERE has_cart)                        AS cart_users,
-        COUNT(*) FILTER (WHERE has_cart AND has_remove_from_cart) AS cart_remove_users
+        COUNT(*) FILTER (WHERE has_cart)                        AS users_with_cart,
+        COUNT(*) FILTER (WHERE has_cart AND has_remove_from_cart) AS users_with_cart_and_remove
     FROM user_month
     GROUP BY month
 ),
 whole AS (
     SELECT
         'all'                                                   AS period,
-        COUNT(*) FILTER (WHERE has_cart)                        AS cart_users,
-        COUNT(*) FILTER (WHERE has_cart AND has_remove_from_cart) AS cart_remove_users
+        COUNT(*) FILTER (WHERE has_cart)                        AS users_with_cart,
+        COUNT(*) FILTER (WHERE has_cart AND has_remove_from_cart) AS users_with_cart_and_remove
     FROM mart.users
 )
 SELECT
     period,
-    cart_users,
-    cart_remove_users,
-    ROUND(100.0 * cart_remove_users / NULLIF(cart_users, 0), 2) AS cart_remove_pct
+    users_with_cart,
+    users_with_cart_and_remove,
+    ROUND(100.0 * users_with_cart_and_remove / NULLIF(users_with_cart, 0), 2) AS cart_remove_pct
 FROM (SELECT * FROM by_month UNION ALL SELECT * FROM whole) t
 ORDER BY period = 'all', period;
 
@@ -276,7 +283,8 @@ CROSS JOIN LATERAL (VALUES
 
 
 -- 4.3. Воронка по месяцам: mart.user_activity_daily против stg.events
---      День и месяц в UTC в обоих источниках. FULL JOIN покажет и месяц,
+--      expected = stg.events, actual = витрина. День и месяц в UTC в обоих
+--      источниках. FULL JOIN покажет и месяц,
 --      который есть только в одном из источников.
 WITH from_daily AS (
     SELECT
@@ -316,12 +324,134 @@ from_stg AS (
 )
 SELECT
     COALESCE(d.month, s.month)                  AS month,
-    d.view_users      AS daily_view,      s.view_users      AS stg_view,
-    d.cart_users      AS daily_cart,      s.cart_users      AS stg_cart,
-    d.purchase_users  AS daily_purchase,  s.purchase_users  AS stg_purchase,
+    s.view_users      AS expected_view,      d.view_users      AS actual_view,
+    s.cart_users      AS expected_cart,      d.cart_users      AS actual_cart,
+    s.purchase_users  AS expected_purchase,  d.purchase_users  AS actual_purchase,
     CASE WHEN (d.view_users, d.cart_users, d.purchase_users)
               IS NOT DISTINCT FROM (s.view_users, s.cart_users, s.purchase_users)
          THEN 'OK' ELSE 'FAIL' END              AS status
 FROM from_daily d
 FULL JOIN from_stg s ON s.month = d.month
 ORDER BY month;
+
+
+-- 4.4. Сессионные метрики по месяцам: mart.sessions против stg.events
+--      Месяц сессии = месяц её первого события (session_start), в stg считается
+--      заново как MIN(event_time) по паре (user_session, user_id).
+WITH from_mart AS (
+    SELECT
+        date_trunc('month', session_start AT TIME ZONE 'UTC')::date     AS month,
+        COUNT(*) FILTER (WHERE has_view)                                AS view_s,
+        COUNT(*) FILTER (WHERE has_view AND has_cart AND has_purchase)  AS conv_s,
+        COUNT(*) FILTER (WHERE has_cart)                                AS cart_s,
+        COUNT(*) FILTER (WHERE has_cart AND has_purchase)               AS cart_purchase_s
+    FROM mart.sessions
+    GROUP BY 1
+),
+from_stg AS (
+    SELECT
+        month,
+        COUNT(*) FILTER (WHERE has_view)                                AS view_s,
+        COUNT(*) FILTER (WHERE has_view AND has_cart AND has_purchase)  AS conv_s,
+        COUNT(*) FILTER (WHERE has_cart)                                AS cart_s,
+        COUNT(*) FILTER (WHERE has_cart AND has_purchase)               AS cart_purchase_s
+    FROM (
+        SELECT
+            date_trunc('month', MIN(event_time) AT TIME ZONE 'UTC')::date AS month,
+            BOOL_OR(event_type = 'view')        AS has_view,
+            BOOL_OR(event_type = 'cart')        AS has_cart,
+            BOOL_OR(event_type = 'purchase')    AS has_purchase
+        FROM stg.events
+        WHERE user_session IS NOT NULL
+        GROUP BY user_session, user_id
+    ) s
+    GROUP BY month
+)
+SELECT
+    COALESCE(s.month, m.month)                  AS month,
+    s.view_s          AS expected_view_s,       m.view_s          AS actual_view_s,
+    s.conv_s          AS expected_conv_s,       m.conv_s          AS actual_conv_s,
+    s.cart_s          AS expected_cart_s,       m.cart_s          AS actual_cart_s,
+    s.cart_purchase_s AS expected_cart_purch_s, m.cart_purchase_s AS actual_cart_purch_s,
+    CASE WHEN (s.view_s, s.conv_s, s.cart_s, s.cart_purchase_s)
+              IS NOT DISTINCT FROM (m.view_s, m.conv_s, m.cart_s, m.cart_purchase_s)
+         THEN 'OK' ELSE 'FAIL' END              AS status
+FROM from_stg s
+FULL JOIN from_mart m ON m.month = s.month
+ORDER BY 1;
+
+
+-- 4.5. Доля удалений из корзины (блок 3): по месяцам и за весь период,
+--      витрины против stg.events. Пользователи с cart и с cart + remove_from_cart.
+WITH m_month AS (
+    SELECT
+        month,
+        COUNT(*) FILTER (WHERE has_cart)                          AS cart_u,
+        COUNT(*) FILTER (WHERE has_cart AND has_remove_from_cart) AS remove_u
+    FROM (
+        SELECT
+            user_id,
+            date_trunc('month', activity_date::timestamp)::date   AS month,
+            BOOL_OR(has_cart)                                     AS has_cart,
+            BOOL_OR(has_remove_from_cart)                         AS has_remove_from_cart
+        FROM mart.user_activity_daily
+        GROUP BY user_id, month
+    ) t
+    GROUP BY month
+),
+s_month AS (
+    SELECT
+        month,
+        COUNT(*) FILTER (WHERE has_cart)                          AS cart_u,
+        COUNT(*) FILTER (WHERE has_cart AND has_remove_from_cart) AS remove_u
+    FROM (
+        SELECT
+            user_id,
+            date_trunc('month', event_time AT TIME ZONE 'UTC')::date AS month,
+            BOOL_OR(event_type = 'cart')                             AS has_cart,
+            BOOL_OR(event_type = 'remove_from_cart')                 AS has_remove_from_cart
+        FROM stg.events
+        GROUP BY user_id, month
+    ) t
+    GROUP BY month
+),
+m_all AS (
+    SELECT
+        COUNT(*) FILTER (WHERE has_cart)                          AS cart_u,
+        COUNT(*) FILTER (WHERE has_cart AND has_remove_from_cart) AS remove_u
+    FROM mart.users
+),
+s_all AS (
+    SELECT
+        COUNT(*) FILTER (WHERE has_cart)                          AS cart_u,
+        COUNT(*) FILTER (WHERE has_cart AND has_remove_from_cart) AS remove_u
+    FROM (
+        SELECT
+            user_id,
+            BOOL_OR(event_type = 'cart')                          AS has_cart,
+            BOOL_OR(event_type = 'remove_from_cart')              AS has_remove_from_cart
+        FROM stg.events
+        GROUP BY user_id
+    ) t
+)
+SELECT *
+FROM (
+    SELECT
+        COALESCE(s.month::text, m.month::text)  AS period,
+        s.cart_u   AS expected_users_with_cart,   m.cart_u   AS actual_users_with_cart,
+        s.remove_u AS expected_with_remove,       m.remove_u AS actual_with_remove,
+        CASE WHEN (s.cart_u, s.remove_u) IS NOT DISTINCT FROM (m.cart_u, m.remove_u)
+             THEN 'OK' ELSE 'FAIL' END          AS status
+    FROM s_month s
+    FULL JOIN m_month m ON m.month = s.month
+    UNION ALL
+    SELECT
+        'all',
+        s.cart_u, m.cart_u,
+        s.remove_u, m.remove_u,
+        CASE WHEN (s.cart_u, s.remove_u) IS NOT DISTINCT FROM (m.cart_u, m.remove_u)
+             THEN 'OK' ELSE 'FAIL' END
+    FROM s_all s
+    CROSS JOIN m_all m
+) t
+ORDER BY period = 'all', period;

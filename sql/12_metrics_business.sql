@@ -13,21 +13,23 @@
 -- 05, 07 и 08.
 --
 -- Источники:
---   * mart.sessions: деньги и заказы (одна строка = сессия пользователя);
+--   * mart.orders: заказы и деньги (одна строка = заказ);
 --   * mart.user_activity_daily: активные пользователи (знаменатели);
 --   * mart.users: итоги за весь период.
 --
 -- Правила (см. раздел 0 в docs/metrics.md):
---   * Заказ = строка mart.sessions с priced_purchases_cnt > 0. Деньги считаем
---     только по покупкам без дублей и с ценой не NULL (это уже учтено в gmv и
---     priced_purchases_cnt витрины).
---   * Заказ и его GMV относим к периоду first_order_time (UTC), а не session_start:
---     сессия может начаться в одну неделю, а покупка случиться в следующую.
---   * Известное ограничение: если в одной сессии покупки лежат по обе стороны
---     границы недели или месяца, весь GMV сессии уходит в период первой
---     покупки. Размер эффекта измеряет блок 5.2 и 5.3.
+--   * Заказ = строка mart.orders: (user_session, user_id, order_time). Деньги
+--     считаем только по покупкам без дублей и с ценой не NULL (это уже учтено
+--     при построении витрины).
+--   * Заказ, его покупки и GMV относим к периоду order_time (UTC). У заказа одно
+--     время, поэтому GMV и покупки по периодам совпадают с расчётом из
+--     stg.events по event_time точно (блоки 5.2 и 5.3).
 --   * Валюта в данных неизвестна: суммы в условных денежных единицах.
 --   * Неделя с понедельника, UTC. Первая и последняя недели неполные.
+--   * Первая неделя данных (особенно 2, 6 и 7 октября) содержит аномальный
+--     приток пользователей без покупок; GMV этих дней нормальный, а доли и
+--     конверсии на пользователя в октябре читать с оговоркой (docs/metrics.md,
+--     раздел 6).
 -- =============================================================================
 
 
@@ -39,16 +41,15 @@
 -- -----------------------------------------------------------------------------
 WITH o AS (
     SELECT
-        date_trunc('month', first_order_time AT TIME ZONE 'UTC')::date  AS month,
+        date_trunc('month', order_time AT TIME ZONE 'UTC')::date  AS month,
         gmv,
-        priced_purchases_cnt
-    FROM mart.sessions
-    WHERE priced_purchases_cnt > 0
+        items_cnt
+    FROM mart.orders
 )
 SELECT
     COALESCE(month::text, 'all')                    AS period,
     ROUND(SUM(gmv), 2)                              AS gmv,
-    SUM(priced_purchases_cnt)                       AS purchases,
+    SUM(items_cnt)                                  AS purchases,
     COUNT(*)                                        AS orders,
     ROUND(SUM(gmv) / NULLIF(COUNT(*), 0), 2)        AS aov
 FROM o
@@ -70,12 +71,11 @@ WITH weeks AS (
 ),
 o AS (
     SELECT
-        date_trunc('week', first_order_time AT TIME ZONE 'UTC')::date   AS week_start,
-        SUM(gmv)                                                        AS gmv,
-        SUM(priced_purchases_cnt)                                       AS purchases,
-        COUNT(*)                                                        AS orders
-    FROM mart.sessions
-    WHERE priced_purchases_cnt > 0
+        date_trunc('week', order_time AT TIME ZONE 'UTC')::date   AS week_start,
+        SUM(gmv)                                                  AS gmv,
+        SUM(items_cnt)                                            AS purchases,
+        COUNT(*)                                                  AS orders
+    FROM mart.orders
     GROUP BY 1
 )
 SELECT
@@ -99,43 +99,35 @@ ORDER BY w.week_start;
 --    orders_per_active = заказы / active_users (близко к доле покупающих)
 --    orders_per_buyer  = заказы / buyers (частота покупок среди платящих)
 --
---    Диагностика к решению про знаменатель ARPPU: any_purchase_users считает всех
---    с любой покупкой, в том числе без цены. Разница между buyers и
---    any_purchase_users показывает, сколько платящих мы теряем, если брать
---    только покупки с ценой.
+--    Строка 'whole period' это отношение за все 5 месяцев, а не среднее
+--    месячных значений: пользователь, активный в нескольких месяцах, попадает в
+--    знаменатель один раз. Поэтому строку 'whole period' нельзя сравнивать с
+--    месячными строками напрямую (ARPPU и заказы на пользователя за период
+--    длиннее, значит выше).
 --
---    Период 'all': из mart.users (активные = все пользователи в витрине).
+--    Период 'whole period': из mart.users (активные = все пользователи в витрине).
 -- -----------------------------------------------------------------------------
 WITH m_orders AS (
     SELECT
-        date_trunc('month', first_order_time AT TIME ZONE 'UTC')::date  AS month,
-        COUNT(DISTINCT user_id)                                         AS buyers,
-        COUNT(*)                                                        AS orders,
-        SUM(gmv)                                                        AS gmv
-    FROM mart.sessions
-    WHERE priced_purchases_cnt > 0
+        date_trunc('month', order_time AT TIME ZONE 'UTC')::date  AS month,
+        COUNT(DISTINCT user_id)                                   AS buyers,
+        COUNT(*)                                                  AS orders,
+        SUM(gmv)                                                  AS gmv
+    FROM mart.orders
     GROUP BY 1
 ),
 m_users AS (
     SELECT
-        month,
-        COUNT(*)                                        AS active_users,
-        COUNT(*) FILTER (WHERE has_purchase)            AS any_purchase_users
-    FROM (
-        SELECT
-            user_id,
-            date_trunc('month', activity_date::timestamp)::date AS month,
-            BOOL_OR(has_purchase)                               AS has_purchase
-        FROM mart.user_activity_daily
-        GROUP BY 1, 2
-    ) um
-    GROUP BY month
+        date_trunc('month', activity_date::timestamp)::date AS month,
+        COUNT(DISTINCT user_id)                             AS active_users
+    FROM mart.user_activity_daily
+    GROUP BY 1
 ),
 by_month AS (
     SELECT
+        'month'                             AS period_kind,
         u.month::text                       AS period,
         u.active_users,
-        u.any_purchase_users,
         COALESCE(o.buyers, 0)               AS buyers,
         COALESCE(o.orders, 0)               AS orders,
         COALESCE(o.gmv, 0)                  AS gmv
@@ -144,27 +136,26 @@ by_month AS (
 ),
 whole AS (
     SELECT
+        'whole period'                                          AS period_kind,
         'all'                                                   AS period,
         COUNT(*)                                                AS active_users,
-        COUNT(*) FILTER (WHERE has_purchase)                    AS any_purchase_users,
         COUNT(*) FILTER (WHERE orders_cnt >= 1)                 AS buyers,
         SUM(orders_cnt)                                         AS orders,
         SUM(gmv)                                                AS gmv
     FROM mart.users
 )
 SELECT
+    period_kind,
     period,
     active_users,
     buyers,
-    any_purchase_users,
     orders,
     ROUND(gmv, 2)                                               AS gmv,
     ROUND(gmv / NULLIF(buyers, 0), 2)                           AS arppu,
-    ROUND(gmv / NULLIF(any_purchase_users, 0), 2)               AS arppu_any_purchase_denominator,
     ROUND(orders::numeric / NULLIF(active_users, 0), 4)         AS orders_per_active,
     ROUND(orders::numeric / NULLIF(buyers, 0), 3)               AS orders_per_buyer
 FROM (SELECT * FROM by_month UNION ALL SELECT * FROM whole) t
-ORDER BY period = 'all', period;
+ORDER BY period_kind = 'whole period', period;
 
 
 -- -----------------------------------------------------------------------------
@@ -188,12 +179,11 @@ WITH weeks AS (
 ),
 o AS (
     SELECT
-        date_trunc('week', first_order_time AT TIME ZONE 'UTC')::date   AS week_start,
-        COUNT(DISTINCT user_id)                                         AS buyers,
-        COUNT(*)                                                        AS orders,
-        SUM(gmv)                                                        AS gmv
-    FROM mart.sessions
-    WHERE priced_purchases_cnt > 0
+        date_trunc('week', order_time AT TIME ZONE 'UTC')::date   AS week_start,
+        COUNT(DISTINCT user_id)                                   AS buyers,
+        COUNT(*)                                                  AS orders,
+        SUM(gmv)                                                  AS gmv
+    FROM mart.orders
     GROUP BY 1
 ),
 joined AS (
@@ -225,17 +215,18 @@ ORDER BY week_start;
 
 -- =============================================================================
 -- 5. Сверка: те же цифры из stg.events напрямую, без витрин
+--    Во всех блоках expected считается из stg.events, actual берётся из витрин.
 -- =============================================================================
 
 -- 5.1. Итоги за весь период. Должно совпасть точно (OK во всех строках).
---      Заказы в stg: число уникальных пар (user_session, user_id) с покупкой
---      без дубля и с ценой; user_session IS NULL исключён, как в mart.sessions.
+--      Заказы в stg: число уникальных моментов покупки (user_session, user_id,
+--      event_time) среди покупок без дубля и с ценой.
 WITH from_mart AS (
     SELECT
         SUM(gmv)                                            AS gmv,
-        SUM(priced_purchases_cnt)                           AS purchases,
-        COUNT(*) FILTER (WHERE priced_purchases_cnt > 0)    AS orders
-    FROM mart.sessions
+        SUM(items_cnt)                                      AS purchases,
+        COUNT(*)                                            AS orders
+    FROM mart.orders
 ),
 from_users AS (
     SELECT SUM(gmv) AS gmv, SUM(orders_cnt) AS orders
@@ -248,10 +239,8 @@ from_stg AS (
         (SELECT COUNT(*) FROM stg.events
           WHERE event_type = 'purchase' AND NOT is_duplicate AND price IS NOT NULL) AS purchases,
         (SELECT COUNT(*) FROM (
-             SELECT 1 FROM stg.events
-              WHERE event_type = 'purchase' AND NOT is_duplicate
-                AND price IS NOT NULL AND user_session IS NOT NULL
-              GROUP BY user_session, user_id
+             SELECT DISTINCT user_session, user_id, event_time FROM stg.events
+              WHERE event_type = 'purchase' AND NOT is_duplicate AND price IS NOT NULL
          ) g)                                                                       AS orders,
         -- контроль гипотезы «покупок без user_session нет»: должно быть 0
         (SELECT COUNT(*) FROM stg.events
@@ -267,78 +256,161 @@ FROM from_mart m
 CROSS JOIN from_users u
 CROSS JOIN from_stg s
 CROSS JOIN LATERAL (VALUES
-    ('GMV: mart.sessions vs stg.events',      s.gmv::numeric,       m.gmv::numeric),
-    ('GMV: mart.users vs stg.events',         s.gmv::numeric,       u.gmv::numeric),
-    ('purchases with price',                  s.purchases::numeric, m.purchases::numeric),
-    ('orders: mart.sessions vs stg.events',   s.orders::numeric,    m.orders::numeric),
-    ('orders: mart.users vs mart.sessions',   m.orders::numeric,    u.orders::numeric),
-    ('purchases without user_session',        0::numeric,           s.purchases_without_session::numeric)
+    ('GMV: mart.orders vs stg.events',           s.gmv::numeric,       m.gmv::numeric),
+    ('GMV: mart.users vs stg.events',            s.gmv::numeric,       u.gmv::numeric),
+    ('purchases with price: mart.orders vs stg', s.purchases::numeric, m.purchases::numeric),
+    ('orders: mart.orders vs stg.events',        s.orders::numeric,    m.orders::numeric),
+    ('orders: mart.users vs mart.orders',        m.orders::numeric,    u.orders::numeric),
+    ('purchases without user_session',           0::numeric,           s.purchases_without_session::numeric)
 ) AS x(check_name, expected, actual);
 
 
--- 5.2. GMV по месяцам: заказы по first_order_time (витрина) против покупок по
---      event_time (stg). Итоги за период равны (см. 5.1), а по месяцам
---      возможен небольшой сдвиг из-за сессий, пересекающих границу месяца.
---      CHECK означает «посмотреть глазами», а не ошибку; порог 0.1%
---      выбран как ориентир, не как стандарт.
+-- 5.2. GMV, покупки и заказы по месяцам: витрина (по order_time) против stg
+--      (по event_time). Совпадение должно быть точным в каждой строке: у заказа
+--      одно время, поэтому сдвига между периодами нет.
 WITH m AS (
     SELECT
-        date_trunc('month', first_order_time AT TIME ZONE 'UTC')::date AS month,
-        SUM(gmv)                                                       AS gmv
-    FROM mart.sessions
-    WHERE priced_purchases_cnt > 0
+        date_trunc('month', order_time AT TIME ZONE 'UTC')::date AS month,
+        SUM(gmv)                                                 AS gmv,
+        SUM(items_cnt)                                           AS purchases,
+        COUNT(*)                                                 AS orders
+    FROM mart.orders
     GROUP BY 1
 ),
 s AS (
     SELECT
-        date_trunc('month', event_time AT TIME ZONE 'UTC')::date       AS month,
-        SUM(price)                                                     AS gmv
+        date_trunc('month', event_time AT TIME ZONE 'UTC')::date AS month,
+        SUM(price)                                               AS gmv,
+        COUNT(*)                                                 AS purchases,
+        COUNT(DISTINCT (user_session, user_id, event_time))      AS orders
     FROM stg.events
     WHERE event_type = 'purchase' AND NOT is_duplicate AND price IS NOT NULL
     GROUP BY 1
 )
 SELECT
-    COALESCE(m.month, s.month)                                  AS month,
-    ROUND(m.gmv, 2)                                             AS gmv_mart,
-    ROUND(s.gmv, 2)                                             AS gmv_stg,
-    ROUND(m.gmv - s.gmv, 2)                                     AS diff,
-    ROUND(100.0 * (m.gmv - s.gmv) / NULLIF(s.gmv, 0), 4)        AS diff_pct,
-    CASE WHEN ABS(100.0 * (m.gmv - s.gmv) / NULLIF(s.gmv, 0)) <= 0.1
-         THEN 'OK' ELSE 'CHECK' END                             AS status
-FROM m
-FULL JOIN s ON s.month = m.month
+    COALESCE(s.month, m.month)                                  AS month,
+    ROUND(s.gmv, 2)                                             AS expected_gmv,
+    ROUND(m.gmv, 2)                                             AS actual_gmv,
+    s.purchases                                                 AS expected_purchases,
+    m.purchases                                                 AS actual_purchases,
+    s.orders                                                    AS expected_orders,
+    m.orders                                                    AS actual_orders,
+    CASE WHEN s.gmv       IS NOT DISTINCT FROM m.gmv
+          AND s.purchases IS NOT DISTINCT FROM m.purchases
+          AND s.orders    IS NOT DISTINCT FROM m.orders
+         THEN 'OK' ELSE 'FAIL' END                              AS status
+FROM s
+FULL JOIN m ON m.month = s.month
 ORDER BY 1;
 
 
--- 5.3. GMV по неделям: то же сравнение. На границе недели (воскресенье,
---      полночь UTC) сдвиг заметнее, чем на границе месяца.
+-- 5.3. То же по неделям.
 WITH m AS (
     SELECT
-        date_trunc('week', first_order_time AT TIME ZONE 'UTC')::date  AS week_start,
-        SUM(gmv)                                                       AS gmv
-    FROM mart.sessions
-    WHERE priced_purchases_cnt > 0
+        date_trunc('week', order_time AT TIME ZONE 'UTC')::date  AS week_start,
+        SUM(gmv)                                                 AS gmv,
+        SUM(items_cnt)                                           AS purchases,
+        COUNT(*)                                                 AS orders
+    FROM mart.orders
     GROUP BY 1
 ),
 s AS (
     SELECT
-        date_trunc('week', event_time AT TIME ZONE 'UTC')::date        AS week_start,
-        SUM(price)                                                     AS gmv
+        date_trunc('week', event_time AT TIME ZONE 'UTC')::date  AS week_start,
+        SUM(price)                                               AS gmv,
+        COUNT(*)                                                 AS purchases,
+        COUNT(DISTINCT (user_session, user_id, event_time))      AS orders
     FROM stg.events
     WHERE event_type = 'purchase' AND NOT is_duplicate AND price IS NOT NULL
     GROUP BY 1
 )
 SELECT
-    COALESCE(m.week_start, s.week_start)                        AS week_start,
-    ROUND(m.gmv, 2)                                             AS gmv_mart,
-    ROUND(s.gmv, 2)                                             AS gmv_stg,
-    ROUND(m.gmv - s.gmv, 2)                                     AS diff,
-    ROUND(100.0 * (m.gmv - s.gmv) / NULLIF(s.gmv, 0), 4)        AS diff_pct,
-    CASE WHEN ABS(100.0 * (m.gmv - s.gmv) / NULLIF(s.gmv, 0)) <= 0.1
-         THEN 'OK' ELSE 'CHECK' END                             AS status
-FROM m
-FULL JOIN s ON s.week_start = m.week_start
+    COALESCE(s.week_start, m.week_start)                        AS week_start,
+    ROUND(s.gmv, 2)                                             AS expected_gmv,
+    ROUND(m.gmv, 2)                                             AS actual_gmv,
+    s.purchases                                                 AS expected_purchases,
+    m.purchases                                                 AS actual_purchases,
+    s.orders                                                    AS expected_orders,
+    m.orders                                                    AS actual_orders,
+    CASE WHEN s.gmv       IS NOT DISTINCT FROM m.gmv
+          AND s.purchases IS NOT DISTINCT FROM m.purchases
+          AND s.orders    IS NOT DISTINCT FROM m.orders
+         THEN 'OK' ELSE 'FAIL' END                              AS status
+FROM s
+FULL JOIN m ON m.week_start = s.week_start
 ORDER BY 1;
+
+
+-- 5.4. Аудитория в блоках 3 и 4: активные пользователи и покупатели по месяцам
+--      и неделям (витрины) против stg.events. В каждой строке считается число
+--      периодов, где значения различаются; ожидается 0.
+WITH m_act AS (
+    SELECT date_trunc('month', activity_date::timestamp)::date AS p,
+           COUNT(DISTINCT user_id)                            AS n
+    FROM mart.user_activity_daily GROUP BY 1
+),
+s_act AS (
+    SELECT date_trunc('month', event_time AT TIME ZONE 'UTC')::date AS p,
+           COUNT(DISTINCT user_id)                                  AS n
+    FROM stg.events GROUP BY 1
+),
+m_buy AS (
+    SELECT date_trunc('month', order_time AT TIME ZONE 'UTC')::date AS p,
+           COUNT(DISTINCT user_id)                                  AS n
+    FROM mart.orders GROUP BY 1
+),
+s_buy AS (
+    SELECT date_trunc('month', event_time AT TIME ZONE 'UTC')::date AS p,
+           COUNT(DISTINCT user_id)                                  AS n
+    FROM stg.events
+    WHERE event_type = 'purchase' AND NOT is_duplicate AND price IS NOT NULL
+    GROUP BY 1
+),
+mw_act AS (
+    SELECT date_trunc('week', activity_date::timestamp)::date AS p,
+           COUNT(DISTINCT user_id)                           AS n
+    FROM mart.user_activity_daily GROUP BY 1
+),
+sw_act AS (
+    SELECT date_trunc('week', event_time AT TIME ZONE 'UTC')::date AS p,
+           COUNT(DISTINCT user_id)                                 AS n
+    FROM stg.events GROUP BY 1
+),
+mw_buy AS (
+    SELECT date_trunc('week', order_time AT TIME ZONE 'UTC')::date AS p,
+           COUNT(DISTINCT user_id)                                 AS n
+    FROM mart.orders GROUP BY 1
+),
+sw_buy AS (
+    SELECT date_trunc('week', event_time AT TIME ZONE 'UTC')::date AS p,
+           COUNT(DISTINCT user_id)                                 AS n
+    FROM stg.events
+    WHERE event_type = 'purchase' AND NOT is_duplicate AND price IS NOT NULL
+    GROUP BY 1
+),
+checks AS (
+    SELECT 'monthly active_users (блок 3)' AS check_name,
+           COUNT(*) FILTER (WHERE a.n IS DISTINCT FROM b.n) AS mismatched
+    FROM m_act a FULL JOIN s_act b USING (p)
+    UNION ALL
+    SELECT 'monthly buyers (блок 3)',
+           COUNT(*) FILTER (WHERE a.n IS DISTINCT FROM b.n)
+    FROM m_buy a FULL JOIN s_buy b USING (p)
+    UNION ALL
+    SELECT 'weekly wau (блок 4)',
+           COUNT(*) FILTER (WHERE a.n IS DISTINCT FROM b.n)
+    FROM mw_act a FULL JOIN sw_act b USING (p)
+    UNION ALL
+    SELECT 'weekly buyers (блок 4)',
+           COUNT(*) FILTER (WHERE a.n IS DISTINCT FROM b.n)
+    FROM mw_buy a FULL JOIN sw_buy b USING (p)
+)
+SELECT
+    check_name,
+    '0'                                                   AS expected,
+    mismatched::text                                      AS actual,
+    CASE WHEN mismatched = 0 THEN 'OK' ELSE 'FAIL' END    AS status
+FROM checks;
 
 
 -- =============================================================================
@@ -356,7 +428,6 @@ SELECT
     ROUND((PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY gmv::float8))::numeric, 2) AS p90_order,
     ROUND((PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY gmv::float8))::numeric, 2) AS p99_order,
     MAX(gmv)                                                            AS max_order,
-    ROUND(AVG(priced_purchases_cnt), 2)                                 AS items_per_order,
-    MAX(priced_purchases_cnt)                                           AS max_items_in_order
-FROM mart.sessions
-WHERE priced_purchases_cnt > 0;
+    ROUND(AVG(items_cnt), 2)                                            AS items_per_order,
+    MAX(items_cnt)                                                      AS max_items_in_order
+FROM mart.orders;
