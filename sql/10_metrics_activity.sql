@@ -6,6 +6,7 @@
 --   3. MAU (по месяцам)
 --   4. Stickiness (среднее DAU за месяц / MAU)
 --   5. Сверка с независимым источником (stg.events)
+--   6. Диагностика октября: аномальные дни 2, 6 и 7 октября (метрики не меняются)
 --
 -- Где запускать: подключение к `cosmetics_shop`, каждый запрос отдельно
 -- (Ctrl+Enter) или весь файл через Execute Script (Alt+X). Запускать после 07 и 08 (блок 5.4 читает mart.users).
@@ -203,3 +204,237 @@ CROSS JOIN LATERAL (VALUES
     ('unique users: user_activity_daily vs stg.events',       u.users_stg, u.users_daily),
     ('days with data (окт 2019 - фев 2020)',                  u.days_stg,  u.days_daily)
 ) AS x(check_name, expected, actual);
+
+
+
+-- =============================================================================
+-- 6. Диагностика октября: аномальные дни 2, 6 и 7 октября 2019
+--    В начале октября приходит аномально много новых пользователей, которые
+--    делают view и cart, но не покупают (docs/metrics.md, раздел 6, п. 11).
+--    Здесь только диагностика: метрики не меняются.
+--
+--    Дни не удаляются, а помечаются: исключать их из расчётов нужно по дате
+--    события, а не по исходу пользователя (иначе конверсия смещается).
+--
+--    Базовая линия: медиана за дни с 2019-11-18 (первая стабильная когорта,
+--    stable_from в 11_metrics_cohorts_retention.sql) до конца данных. Медиана,
+--    а не среднее: на среднее влияют пики Black Friday и праздничные провалы.
+--    Данные начинаются 1 октября, поэтому «новыми» в первые недели выглядят и
+--    вернувшиеся старые клиенты: множитель new_users_x_baseline в обычные дни
+--    начала октября тоже выше 1. Аномальные дни надо оценивать по разрыву с
+--    соседними днями, а не по самому факту превышения.
+-- =============================================================================
+
+-- 6.1. Дни с 1 по 13 октября: пользователи, воронка дня, заказы и GMV
+--      new_users           : первый день пользователя в данных = этот день
+--      new_view_cart_users : новые пользователи с view и cart в этот день
+--      view_to_cart_pct    : пользователи дня с view и cart / с view (как в 09)
+--      view_to_cart_baseline_pct : медиана view_to_cart_pct за дни базовой линии
+--                            (дневная конверсия, не сопоставима с месячной из 09)
+--      *_x_baseline        : значение дня / медиана базовой линии
+--      Ожидаем: у 2, 6 и 7 октября new_users в 2-3 раза выше базовой линии, а
+--      purchase_users, orders и gmv около 1.
+WITH daily AS (
+    SELECT
+        d.activity_date,
+        COUNT(*)                                                    AS active_users,
+        COUNT(*) FILTER (WHERE d.activity_date = u.first_activity_date)
+                                                                    AS new_users,
+        COUNT(*) FILTER (WHERE d.activity_date = u.first_activity_date
+                           AND d.has_view AND d.has_cart)           AS new_view_cart_users,
+        COUNT(*) FILTER (WHERE d.has_view)                          AS view_users,
+        COUNT(*) FILTER (WHERE d.has_view AND d.has_cart)           AS cart_users,
+        COUNT(*) FILTER (WHERE d.has_purchase)                      AS purchase_users
+    FROM mart.user_activity_daily d
+    JOIN mart.users u USING (user_id)
+    GROUP BY d.activity_date
+),
+orders_daily AS (
+    SELECT
+        (order_time AT TIME ZONE 'UTC')::date                       AS activity_date,
+        COUNT(*)                                                    AS orders,
+        SUM(gmv)                                                    AS gmv
+    FROM mart.orders
+    GROUP BY 1
+),
+joined AS (
+    SELECT
+        d.*,
+        COALESCE(o.orders, 0)                                       AS orders,
+        COALESCE(o.gmv, 0)                                          AS gmv
+    FROM daily d
+    LEFT JOIN orders_daily o USING (activity_date)
+),
+baseline AS (
+    SELECT
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY new_users)      AS new_users,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY purchase_users) AS purchase_users,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY orders)         AS orders,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY gmv)            AS gmv,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (
+            ORDER BY 100.0 * cart_users / NULLIF(view_users, 0))    AS view_to_cart_pct
+    FROM joined
+    WHERE activity_date >= DATE '2019-11-18'
+)
+SELECT
+    j.activity_date,
+    j.active_users,
+    j.new_users,
+    j.new_view_cart_users,
+    ROUND(100.0 * j.cart_users / NULLIF(j.view_users, 0), 2)        AS view_to_cart_pct,
+    ROUND(b.view_to_cart_pct::numeric, 2)                           AS view_to_cart_baseline_pct,
+    j.purchase_users,
+    j.orders,
+    ROUND(j.gmv, 2)                                                 AS gmv,
+    ROUND(j.new_users::numeric       / NULLIF(b.new_users, 0)::numeric, 2)       AS new_users_x_baseline,
+    ROUND(j.purchase_users::numeric  / NULLIF(b.purchase_users, 0)::numeric, 2)  AS purchase_users_x_baseline,
+    ROUND(j.orders::numeric          / NULLIF(b.orders, 0)::numeric, 2)          AS orders_x_baseline,
+    ROUND(j.gmv::numeric             / NULLIF(b.gmv, 0)::numeric, 2)             AS gmv_x_baseline
+FROM joined j
+CROSS JOIN baseline b
+WHERE j.activity_date BETWEEN DATE '2019-10-01' AND DATE '2019-10-13'
+ORDER BY j.activity_date;
+
+
+-- 6.2. Базовая линия и «хвост»: максимум new_users_x_baseline после 7 октября.
+--      Показывает, насколько высокие значения бывают вне аномальных дней, и
+--      сравнивается с множителями 2, 6 и 7 октября из 6.1.
+--      cohort_check: сумма new_users за 1-6 октября равна размеру первой когорты
+--      (по определению когорты, понедельник 2019-09-30).
+WITH new_daily AS (
+    -- те же дни и тот же способ, что в 6.1: день без новых пользователей даёт 0
+    SELECT
+        d.activity_date,
+        COUNT(*) FILTER (WHERE d.activity_date = u.first_activity_date) AS new_users
+    FROM mart.user_activity_daily d
+    JOIN mart.users u USING (user_id)
+    GROUP BY d.activity_date
+),
+baseline AS (
+    SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY new_users) AS median_new_users
+    FROM new_daily
+    WHERE activity_date >= DATE '2019-11-18'
+)
+SELECT
+    ROUND(b.median_new_users::numeric, 1)                            AS median_new_users_from_2019_11_18,
+    MAX(n.new_users)                                                 AS max_new_users_after_oct_7,
+    ROUND(MAX(n.new_users)::numeric / NULLIF(b.median_new_users, 0)::numeric, 2)
+                                                                     AS max_x_baseline_after_oct_7,
+    (SELECT SUM(new_users) FROM new_daily
+     WHERE activity_date BETWEEN DATE '2019-10-01' AND DATE '2019-10-06')
+                                                                     AS new_users_oct_1_6,
+    (SELECT COUNT(*) FROM mart.users WHERE cohort_week = DATE '2019-09-30')
+                                                                     AS first_cohort_size,
+    CASE WHEN (SELECT SUM(new_users) FROM new_daily
+               WHERE activity_date BETWEEN DATE '2019-10-01' AND DATE '2019-10-06')
+              = (SELECT COUNT(*) FROM mart.users WHERE cohort_week = DATE '2019-09-30')
+         THEN 'OK' ELSE 'FAIL' END                                   AS cohort_check
+FROM new_daily n
+CROSS JOIN baseline b
+WHERE n.activity_date > DATE '2019-10-07'
+GROUP BY b.median_new_users;
+
+
+-- 6.3. Сверка 6.1 с stg.events напрямую (все дни данных, не только октябрь).
+--      Ожидаем days_mismatch = 0 и OK во всех строках.
+--      user-day флаги из stg считаются независимо от mart.user_activity_daily.
+WITH stg_user_day AS (
+    SELECT
+        user_id,
+        (event_time AT TIME ZONE 'UTC')::date                       AS day,
+        BOOL_OR(event_type = 'view')                                AS has_view,
+        BOOL_OR(event_type = 'cart')                                AS has_cart,
+        BOOL_OR(event_type = 'purchase')                            AS has_purchase
+    FROM stg.events
+    GROUP BY 1, 2
+),
+stg_first AS (
+    SELECT user_id, MIN(day) AS first_day
+    FROM stg_user_day
+    GROUP BY 1
+),
+s_users AS (
+    SELECT
+        d.day,
+        COUNT(*) FILTER (WHERE d.day = f.first_day)                 AS new_users,
+        COUNT(*) FILTER (WHERE d.day = f.first_day
+                           AND d.has_view AND d.has_cart)           AS new_view_cart_users,
+        COUNT(*) FILTER (WHERE d.has_view)                          AS view_users,
+        COUNT(*) FILTER (WHERE d.has_view AND d.has_cart)           AS cart_users,
+        COUNT(*) FILTER (WHERE d.has_purchase)                      AS purchase_users
+    FROM stg_user_day d
+    JOIN stg_first f USING (user_id)
+    GROUP BY d.day
+),
+s_orders AS (
+    -- заказ = (сессия, пользователь, момент покупки): покупка без дубля и с ценой
+    SELECT
+        (event_time AT TIME ZONE 'UTC')::date                       AS day,
+        COUNT(DISTINCT (user_session, user_id, event_time))         AS orders,
+        SUM(price)                                                  AS gmv
+    FROM stg.events
+    WHERE event_type = 'purchase'
+      AND NOT is_duplicate
+      AND price IS NOT NULL
+      AND user_session IS NOT NULL
+    GROUP BY 1
+),
+s AS (
+    SELECT
+        u.day,
+        u.new_users, u.new_view_cart_users, u.view_users, u.cart_users, u.purchase_users,
+        COALESCE(o.orders, 0)                                       AS orders,
+        COALESCE(o.gmv, 0)                                          AS gmv
+    FROM s_users u
+    LEFT JOIN s_orders o USING (day)
+),
+m_users AS (
+    SELECT
+        d.activity_date                                             AS day,
+        COUNT(*) FILTER (WHERE d.activity_date = u.first_activity_date)
+                                                                    AS new_users,
+        COUNT(*) FILTER (WHERE d.activity_date = u.first_activity_date
+                           AND d.has_view AND d.has_cart)           AS new_view_cart_users,
+        COUNT(*) FILTER (WHERE d.has_view)                          AS view_users,
+        COUNT(*) FILTER (WHERE d.has_view AND d.has_cart)           AS cart_users,
+        COUNT(*) FILTER (WHERE d.has_purchase)                      AS purchase_users
+    FROM mart.user_activity_daily d
+    JOIN mart.users u USING (user_id)
+    GROUP BY d.activity_date
+),
+m_orders AS (
+    SELECT
+        (order_time AT TIME ZONE 'UTC')::date                       AS day,
+        COUNT(*)                                                    AS orders,
+        SUM(gmv)                                                    AS gmv
+    FROM mart.orders
+    GROUP BY 1
+),
+m AS (
+    SELECT
+        u.day,
+        u.new_users, u.new_view_cart_users, u.view_users, u.cart_users, u.purchase_users,
+        COALESCE(o.orders, 0)                                       AS orders,
+        COALESCE(o.gmv, 0)                                          AS gmv
+    FROM m_users u
+    LEFT JOIN m_orders o USING (day)
+)
+SELECT
+    x.check_name,
+    COUNT(*)                                                        AS days_compared,
+    COUNT(*) FILTER (WHERE x.expected IS DISTINCT FROM x.actual)    AS days_mismatch,
+    CASE WHEN COUNT(*) FILTER (WHERE x.expected IS DISTINCT FROM x.actual) = 0
+         THEN 'OK' ELSE 'FAIL' END                                  AS status
+FROM s
+FULL JOIN m USING (day)
+CROSS JOIN LATERAL (VALUES
+    ('daily new_users',           s.new_users::numeric,           m.new_users::numeric),
+    ('daily new_view_cart_users', s.new_view_cart_users::numeric, m.new_view_cart_users::numeric),
+    ('daily view_users',          s.view_users::numeric,          m.view_users::numeric),
+    ('daily cart_users',          s.cart_users::numeric,          m.cart_users::numeric),
+    ('daily purchase_users',      s.purchase_users::numeric,      m.purchase_users::numeric),
+    ('daily orders',              s.orders::numeric,              m.orders::numeric),
+    ('daily gmv',                 s.gmv::numeric,                 m.gmv::numeric)
+) AS x(check_name, expected, actual)
+GROUP BY x.check_name
+ORDER BY x.check_name;
