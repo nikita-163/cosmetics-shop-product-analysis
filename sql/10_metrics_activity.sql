@@ -7,6 +7,7 @@
 --   4. Stickiness (среднее DAU за месяц / MAU)
 --   5. Сверка с независимым источником (stg.events)
 --   6. Диагностика октября: аномальные дни 2, 6 и 7 октября (метрики не меняются)
+--   7. Чувствительность октября: MAU, stickiness и WAU без аномальных дней
 --
 -- Где запускать: подключение к `cosmetics_shop`, каждый запрос отдельно
 -- (Ctrl+Enter) или весь файл через Execute Script (Alt+X). Запускать после 07 и 08 (блок 5.4 читает mart.users).
@@ -438,3 +439,175 @@ CROSS JOIN LATERAL (VALUES
 ) AS x(check_name, expected, actual)
 GROUP BY x.check_name
 ORDER BY x.check_name;
+
+
+
+-- =============================================================================
+-- 7. Чувствительность октября: активность без аномальных дней
+--    Сценарии те же, что в блоке 5 файла 09_metrics_funnel.sql (описание, зачем
+--    нужен каждый и почему дни не удаляются, там же): как есть; без 2, 6, 7 окт;
+--    без 1, 2, 6, 7, 8 окт; placebo (без 9-13 окт). Список дней задан в блоке
+--    scenarios каждого запроса: при изменении поправить во всех запросах блока 7
+--    и в блоке 5 файла 09.
+--
+--    Метрики с учётом исключения дней:
+--      * MAU и WAU считаются по оставшимся дням: исключение дня уменьшает их
+--        механически, поэтому абсолютные значения разных сценариев сравнивать
+--        нельзя без days_used;
+--      * avg_dau = сумма DAU по оставшимся дням / days_used (по дням с данными,
+--        а не по всем дням месяца, как в блоке 4);
+--      * stickiness = avg_dau / MAU. Для сравнения сценариев НЕ подходит: MAU
+--        с сокращением окна падает быстрее, чем avg_dau, поэтому stickiness растёт
+--        механически при исключении любых дней (это видно по placebo). Сравнивать
+--        сценарии по avg_dau: среднее по дню от числа дней не зависит. Строка
+--        октября «as is» должна совпасть с блоком 4 (самопроверка).
+--    Ноябрь-февраль и недели с 14 октября показаны «как есть» для сравнения.
+-- =============================================================================
+
+-- 7.1. MAU, avg_dau и stickiness: октябрь по сценариям, ноябрь-февраль как есть
+WITH scenarios (scenario, sort_order, excluded_days) AS (
+    VALUES
+        ('as is',                  1, ARRAY[]::date[]),
+        ('excl. Oct 2, 6, 7',      2, ARRAY[DATE '2019-10-02', DATE '2019-10-06', DATE '2019-10-07']),
+        ('excl. Oct 1, 2, 6, 7, 8', 3, ARRAY[DATE '2019-10-01', DATE '2019-10-02', DATE '2019-10-06',
+                                              DATE '2019-10-07', DATE '2019-10-08']),
+        ('placebo: excl. Oct 9-13', 4, ARRAY[DATE '2019-10-09', DATE '2019-10-10', DATE '2019-10-11',
+                                              DATE '2019-10-12', DATE '2019-10-13'])
+),
+user_day AS (
+    SELECT
+        sc.scenario,
+        sc.sort_order,
+        date_trunc('month', d.activity_date::timestamp)::date   AS month,
+        d.user_id,
+        d.activity_date
+    FROM mart.user_activity_daily d
+    JOIN scenarios sc
+      ON NOT (d.activity_date = ANY (sc.excluded_days))
+    WHERE d.activity_date < DATE '2019-11-01'
+    UNION ALL
+    SELECT
+        'as is', 1,
+        date_trunc('month', activity_date::timestamp)::date,
+        user_id, activity_date
+    FROM mart.user_activity_daily
+    WHERE activity_date >= DATE '2019-11-01'
+)
+SELECT
+    month,
+    scenario,
+    COUNT(DISTINCT user_id)                                                 AS mau,
+    COUNT(DISTINCT activity_date)                                           AS days_used,
+    ROUND(COUNT(*)::numeric / COUNT(DISTINCT activity_date), 1)             AS avg_dau,
+    ROUND(100.0 * COUNT(*) / COUNT(DISTINCT activity_date)
+          / COUNT(DISTINCT user_id), 2)                                     AS stickiness_pct
+FROM user_day
+GROUP BY month, scenario, sort_order
+ORDER BY month, sort_order;
+
+
+-- 7.2. WAU и avg_dau недели: две первые недели (30 сентября и 7 октября) по
+--      сценариям, недели с 14 октября по 28 октября как есть.
+--      Неделя, из которой исключены дни, неполная: смотреть days_used и avg_dau.
+WITH scenarios (scenario, sort_order, excluded_days) AS (
+    VALUES
+        ('as is',                  1, ARRAY[]::date[]),
+        ('excl. Oct 2, 6, 7',      2, ARRAY[DATE '2019-10-02', DATE '2019-10-06', DATE '2019-10-07']),
+        ('excl. Oct 1, 2, 6, 7, 8', 3, ARRAY[DATE '2019-10-01', DATE '2019-10-02', DATE '2019-10-06',
+                                              DATE '2019-10-07', DATE '2019-10-08']),
+        ('placebo: excl. Oct 9-13', 4, ARRAY[DATE '2019-10-09', DATE '2019-10-10', DATE '2019-10-11',
+                                              DATE '2019-10-12', DATE '2019-10-13'])
+),
+user_day AS (
+    SELECT
+        sc.scenario,
+        sc.sort_order,
+        date_trunc('week', d.activity_date::timestamp)::date    AS week_start,
+        d.user_id,
+        d.activity_date
+    FROM mart.user_activity_daily d
+    JOIN scenarios sc
+      ON NOT (d.activity_date = ANY (sc.excluded_days))
+    WHERE d.activity_date < DATE '2019-10-14'
+    UNION ALL
+    SELECT
+        'as is', 1,
+        date_trunc('week', activity_date::timestamp)::date,
+        user_id, activity_date
+    FROM mart.user_activity_daily
+    WHERE activity_date >= DATE '2019-10-14'
+      AND activity_date <  DATE '2019-11-04'
+)
+SELECT
+    week_start,
+    scenario,
+    COUNT(DISTINCT user_id)                                                 AS wau,
+    COUNT(DISTINCT activity_date)                                           AS days_used,
+    ROUND(COUNT(*)::numeric / COUNT(DISTINCT activity_date), 1)             AS avg_dau
+FROM user_day
+GROUP BY week_start, scenario, sort_order
+ORDER BY week_start, sort_order;
+
+
+-- 7.3. Сверка 7.1 и 7.2 (октябрь и две первые недели): mart.user_activity_daily
+--      против stg.events. В stg «пользователь-день» считается заново.
+--      Сравниваются число пользователей, число дней и число пар «пользователь-день»
+--      (из них следует avg_dau). Ожидаем OK во всех строках.
+WITH scenarios (scenario, sort_order, excluded_days) AS (
+    VALUES
+        ('as is',                  1, ARRAY[]::date[]),
+        ('excl. Oct 2, 6, 7',      2, ARRAY[DATE '2019-10-02', DATE '2019-10-06', DATE '2019-10-07']),
+        ('excl. Oct 1, 2, 6, 7, 8', 3, ARRAY[DATE '2019-10-01', DATE '2019-10-02', DATE '2019-10-06',
+                                              DATE '2019-10-07', DATE '2019-10-08']),
+        ('placebo: excl. Oct 9-13', 4, ARRAY[DATE '2019-10-09', DATE '2019-10-10', DATE '2019-10-11',
+                                              DATE '2019-10-12', DATE '2019-10-13'])
+),
+ud AS (
+    SELECT 'mart' AS src, user_id, activity_date AS day
+    FROM mart.user_activity_daily
+    UNION ALL
+    SELECT 'stg', user_id, day
+    FROM (
+        SELECT DISTINCT user_id, (event_time AT TIME ZONE 'UTC')::date AS day
+        FROM stg.events
+    ) s
+),
+agg AS (
+    SELECT
+        ud.src, sc.scenario, 'month'                                AS period_kind,
+        DATE '2019-10-01'                                           AS period_start,
+        COUNT(DISTINCT ud.user_id)                                  AS users,
+        COUNT(DISTINCT ud.day)                                      AS days_used,
+        COUNT(*)                                                    AS user_days
+    FROM ud
+    JOIN scenarios sc ON NOT (ud.day = ANY (sc.excluded_days))
+    WHERE ud.day < DATE '2019-11-01'
+    GROUP BY ud.src, sc.scenario
+    UNION ALL
+    SELECT
+        ud.src, sc.scenario, 'week',
+        date_trunc('week', ud.day::timestamp)::date,
+        COUNT(DISTINCT ud.user_id),
+        COUNT(DISTINCT ud.day),
+        COUNT(*)
+    FROM ud
+    JOIN scenarios sc ON NOT (ud.day = ANY (sc.excluded_days))
+    WHERE ud.day < DATE '2019-10-14'
+    GROUP BY ud.src, sc.scenario, date_trunc('week', ud.day::timestamp)::date
+)
+SELECT
+    COALESCE(s.scenario, m.scenario)                AS scenario,
+    COALESCE(s.period_kind, m.period_kind)          AS period_kind,
+    COALESCE(s.period_start, m.period_start)        AS period_start,
+    s.users     AS expected_users,      m.users     AS actual_users,
+    s.days_used AS expected_days,       m.days_used AS actual_days,
+    s.user_days AS expected_user_days,  m.user_days AS actual_user_days,
+    CASE WHEN (s.users, s.days_used, s.user_days)
+              IS NOT DISTINCT FROM (m.users, m.days_used, m.user_days)
+         THEN 'OK' ELSE 'FAIL' END                  AS status
+FROM (SELECT * FROM agg WHERE src = 'stg')  s
+FULL JOIN (SELECT * FROM agg WHERE src = 'mart') m
+       ON m.scenario = s.scenario
+      AND m.period_kind = s.period_kind
+      AND m.period_start = s.period_start
+ORDER BY 3, 2, 1;
