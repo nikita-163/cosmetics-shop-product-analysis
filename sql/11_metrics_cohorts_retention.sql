@@ -7,6 +7,7 @@
 --   4. Repeat purchase rate за 30 дней (сопоставимо по когортам)
 --   5. Время до повторной покупки
 --   6. Сверка с независимым источником (stg.events)
+--   7. Чувствительность первых когорт к аномальным дням октября
 --
 -- Где запускать: подключение к `cosmetics_shop`, запросы по порядку в ОДНОМ
 -- окне SQL-редактора (блок 2 создаёт временную таблицу, она живёт только в
@@ -522,3 +523,149 @@ CROSS JOIN LATERAL (VALUES
     ('eligible buyers (full 30-day window)', s.eligible_buyers, m.eligible_buyers),
     ('repeat within 30 days',                s.repeat_30d,      m.repeat_30d)
 ) AS x(check_name, expected, actual);
+
+
+
+-- =============================================================================
+-- 7. Чувствительность первых когорт к аномальным дням октября
+--    Сценарии те же, что в блоке 5 файла 09_metrics_funnel.sql и в блоке 7 файла
+--    10_metrics_activity.sql: как есть; без 2, 6, 7 окт; без 1, 2, 6, 7, 8 окт;
+--    placebo (без 9-13 окт). Список дней задан в блоке scenarios каждого запроса:
+--    при изменении поправить во всех.
+--
+--    Правило: когорта пересчитывается по оставшейся активности, как будто
+--    исключённых дней нет. Пользователь, у которого все дни исключены, из когорт
+--    пропадает; вернувшийся позже попадает в когорту первой оставшейся недели.
+--    Это не то же самое, что mart.users.cohort_week: здесь неделя первой
+--    активности считается заново для каждого сценария.
+--
+--    Ограничение: исключение дней делает неделю неполной, а retention недели N по
+--    такой неделе занижен механически (у пользователя меньше дней, чтобы быть
+--    активным). Колонка days_excluded_in_week_n показывает число исключённых дней
+--    в неделе когорта + N; для сравнения использовать недели, где он равен 0.
+--    Исключённые дни попадают только в недели 0 и 1 когорты 30 сентября и в
+--    неделю 0 когорты 7 октября; недели 2-4 первой когорты и недели 1-4 второй
+--    чистые, у когорт 14 и 21 октября исключённых дней нет вовсе. Размер когорты
+--    исключение дней механически не искажает.
+--
+--    Только первые четыре когорты (30 сентября - 21 октября): к ним относятся
+--    аномальные дни, а более поздние пересчитывать смысла нет. Для скорости
+--    берутся дни до 24 ноября (хватает на неделю 4 последней из этих когорт).
+--
+--    Результат хранится во временной таблице tmp_cohort_sensitivity (запускать
+--    блоки 7.1 и 7.2 в одном окне SQL-редактора, как блок 2).
+-- =============================================================================
+
+DROP TABLE IF EXISTS tmp_cohort_sensitivity;
+
+CREATE TEMP TABLE tmp_cohort_sensitivity AS
+WITH scenarios (scenario, sort_order, excluded_days) AS (
+    VALUES
+        ('as is',                  1, ARRAY[]::date[]),
+        ('excl. Oct 2, 6, 7',      2, ARRAY[DATE '2019-10-02', DATE '2019-10-06', DATE '2019-10-07']),
+        ('excl. Oct 1, 2, 6, 7, 8', 3, ARRAY[DATE '2019-10-01', DATE '2019-10-02', DATE '2019-10-06',
+                                              DATE '2019-10-07', DATE '2019-10-08']),
+        ('placebo: excl. Oct 9-13', 4, ARRAY[DATE '2019-10-09', DATE '2019-10-10', DATE '2019-10-11',
+                                              DATE '2019-10-12', DATE '2019-10-13'])
+),
+ud AS (
+    SELECT 'mart' AS src, user_id, activity_date AS day
+    FROM mart.user_activity_daily
+    WHERE activity_date < DATE '2019-11-25'
+    UNION ALL
+    SELECT 'stg', user_id, day
+    FROM (
+        SELECT DISTINCT user_id, (event_time AT TIME ZONE 'UTC')::date AS day
+        FROM stg.events
+        WHERE (event_time AT TIME ZONE 'UTC')::date < DATE '2019-11-25'
+    ) s
+),
+ud_sc AS (
+    SELECT ud.src, sc.scenario, sc.sort_order, ud.user_id, ud.day
+    FROM ud
+    JOIN scenarios sc ON NOT (ud.day = ANY (sc.excluded_days))
+),
+cohort_user AS (
+    SELECT
+        src, scenario, sort_order, user_id,
+        date_trunc('week', MIN(day)::timestamp)::date               AS cohort_week
+    FROM ud_sc
+    GROUP BY src, scenario, sort_order, user_id
+),
+user_week AS (
+    SELECT DISTINCT src, scenario, user_id, date_trunc('week', day::timestamp)::date AS activity_week
+    FROM ud_sc
+)
+SELECT
+    c.src,
+    c.scenario,
+    c.sort_order,
+    c.cohort_week,
+    COUNT(DISTINCT c.user_id)                                       AS cohort_size,
+    COUNT(*) FILTER (WHERE (w.activity_week - c.cohort_week) / 7 = 1) AS active_w1,
+    COUNT(*) FILTER (WHERE (w.activity_week - c.cohort_week) / 7 = 2) AS active_w2,
+    COUNT(*) FILTER (WHERE (w.activity_week - c.cohort_week) / 7 = 3) AS active_w3,
+    COUNT(*) FILTER (WHERE (w.activity_week - c.cohort_week) / 7 = 4) AS active_w4
+FROM cohort_user c
+LEFT JOIN user_week w
+       ON w.src = c.src AND w.scenario = c.scenario AND w.user_id = c.user_id
+      AND w.activity_week > c.cohort_week
+WHERE c.cohort_week BETWEEN DATE '2019-09-30' AND DATE '2019-10-21'
+GROUP BY c.src, c.scenario, c.sort_order, c.cohort_week;
+
+
+-- 7.1. Размеры и retention первых четырёх когорт по сценариям (источник: mart)
+--      cohort_size                : размер когорты после пересчёта;
+--      ret_wN_pct                 : активные в неделе когорта + N / размер когорты;
+--      days_excluded_in_week_n    : сколько исключённых дней попало в неделю N
+--                                   (если не 0, retention недели N занижен).
+--      Строки «as is» должны совпасть с размерами когорт в блоке 1 и с
+--      retention в блоке 2 (самопроверка).
+WITH scenarios (scenario, sort_order, excluded_days) AS (
+    VALUES
+        ('as is',                  1, ARRAY[]::date[]),
+        ('excl. Oct 2, 6, 7',      2, ARRAY[DATE '2019-10-02', DATE '2019-10-06', DATE '2019-10-07']),
+        ('excl. Oct 1, 2, 6, 7, 8', 3, ARRAY[DATE '2019-10-01', DATE '2019-10-02', DATE '2019-10-06',
+                                              DATE '2019-10-07', DATE '2019-10-08']),
+        ('placebo: excl. Oct 9-13', 4, ARRAY[DATE '2019-10-09', DATE '2019-10-10', DATE '2019-10-11',
+                                              DATE '2019-10-12', DATE '2019-10-13'])
+)
+SELECT
+    t.cohort_week,
+    t.scenario,
+    t.cohort_size,
+    ROUND(100.0 * t.active_w1 / NULLIF(t.cohort_size, 0), 2)        AS ret_w1_pct,
+    ROUND(100.0 * t.active_w2 / NULLIF(t.cohort_size, 0), 2)        AS ret_w2_pct,
+    ROUND(100.0 * t.active_w3 / NULLIF(t.cohort_size, 0), 2)        AS ret_w3_pct,
+    ROUND(100.0 * t.active_w4 / NULLIF(t.cohort_size, 0), 2)        AS ret_w4_pct,
+    (SELECT COUNT(*) FROM unnest(sc.excluded_days) x
+      WHERE date_trunc('week', x::timestamp)::date = t.cohort_week + 7)  AS days_excluded_in_week_1,
+    (SELECT COUNT(*) FROM unnest(sc.excluded_days) x
+      WHERE date_trunc('week', x::timestamp)::date = t.cohort_week + 14) AS days_excluded_in_week_2,
+    (SELECT COUNT(*) FROM unnest(sc.excluded_days) x
+      WHERE date_trunc('week', x::timestamp)::date = t.cohort_week)      AS days_excluded_in_week_0
+FROM tmp_cohort_sensitivity t
+JOIN scenarios sc ON sc.scenario = t.scenario
+WHERE t.src = 'mart'
+ORDER BY t.cohort_week, t.sort_order;
+
+
+-- 7.2. Сверка 7.1: mart.user_activity_daily против stg.events (флаги
+--      «пользователь-день» из stg считаются заново). Сравниваются размер когорты и
+--      число активных в неделях 1-4. Ожидаем OK во всех строках.
+SELECT
+    COALESCE(s.cohort_week, m.cohort_week)          AS cohort_week,
+    COALESCE(s.scenario, m.scenario)                AS scenario,
+    s.cohort_size AS expected_size,   m.cohort_size AS actual_size,
+    s.active_w1   AS expected_w1,     m.active_w1   AS actual_w1,
+    s.active_w2   AS expected_w2,     m.active_w2   AS actual_w2,
+    s.active_w3   AS expected_w3,     m.active_w3   AS actual_w3,
+    s.active_w4   AS expected_w4,     m.active_w4   AS actual_w4,
+    CASE WHEN (s.cohort_size, s.active_w1, s.active_w2, s.active_w3, s.active_w4)
+              IS NOT DISTINCT FROM
+              (m.cohort_size, m.active_w1, m.active_w2, m.active_w3, m.active_w4)
+         THEN 'OK' ELSE 'FAIL' END                  AS status
+FROM (SELECT * FROM tmp_cohort_sensitivity WHERE src = 'stg')  s
+FULL JOIN (SELECT * FROM tmp_cohort_sensitivity WHERE src = 'mart') m
+       ON m.cohort_week = s.cohort_week AND m.scenario = s.scenario
+ORDER BY 1, 2;
